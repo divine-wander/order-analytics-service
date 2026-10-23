@@ -11,32 +11,90 @@ from flask import Flask, jsonify
 from flask_cors import CORS
 
 
-# Load environment variables from the local .env file.
-# In Azure, these values come from App Service environment variables.
+# Load local environment variables.
+# Azure App Service uses its configured environment variables instead.
 load_dotenv()
 
 
 # Create the Flask application.
 app = Flask(__name__)
-
-# Allow requests from other origins such as the Store Front application.
 CORS(app)
 
 
-# Store consumed orders in memory.
-# These orders will be lost whenever the service restarts.
+# Orders are stored in memory for this project.
+# The list resets whenever the service restarts.
 orders = []
 
-# Protect the shared orders list because the RabbitMQ consumer
-# runs in a background thread while Flask handles API requests.
+# Protect the shared list because Flask and the RabbitMQ
+# consumer run in separate threads.
 orders_lock = threading.Lock()
+
+
+def normalize_order(order):
+    """
+    Convert incoming orders into one consistent structure.
+
+    The REST Client sends:
+        product: "Cat Food"
+        price: 34.99
+        total: 69.98
+
+    The Vue Store Front sends:
+        product: {
+            id: 2,
+            name: "Cat Food",
+            price: 34.99
+        }
+        totalPrice: 69.98
+
+    Both formats are normalized here.
+    """
+
+    product = order.get("product", "Unknown")
+
+    # Store Front sends product as an object.
+    if isinstance(product, dict):
+        product_name = product.get("name", "Unknown")
+        price = float(product.get("price", 0))
+        product_id = product.get("id")
+    else:
+        # REST Client may send product as a plain string.
+        product_name = str(product)
+        price = float(order.get("price", 0))
+        product_id = order.get("product_id")
+
+    quantity = int(order.get("quantity", 1))
+
+    # Support both payload formats.
+    total = order.get("total")
+
+    if total is None:
+        total = order.get("totalPrice")
+
+    # If neither total field exists, calculate it.
+    if total is None:
+        total = price * quantity
+
+    normalized_order = {
+        "product": product_name,
+        "quantity": quantity,
+        "price": round(price, 2),
+        "total": round(float(total), 2)
+    }
+
+    # Preserve product ID when one exists.
+    if product_id is not None:
+        normalized_order["product_id"] = product_id
+
+    return normalized_order
 
 
 @app.route("/health", methods=["GET"])
 def health():
     """
-    Health check endpoint used to confirm that the service is running.
+    Confirm that the Order Analytics Service is running.
     """
+
     return jsonify({
         "status": "healthy",
         "service": "order-analytics-service"
@@ -46,20 +104,19 @@ def health():
 @app.route("/orders", methods=["GET"])
 def get_orders():
     """
-    Return all orders successfully consumed from RabbitMQ.
+    Return all orders consumed from RabbitMQ.
     """
+
     with orders_lock:
-        return jsonify(orders)
+        return jsonify(list(orders))
 
 
 @app.route("/analytics/summary", methods=["GET"])
 def analytics_summary():
     """
-    Return overall order statistics.
-
-    The summary includes:
-    - total number of orders
-    - total quantity of products ordered
+    Return overall analytics:
+    - total orders
+    - total items
     - total revenue
     - average order value
     """
@@ -68,20 +125,22 @@ def analytics_summary():
         current_orders = list(orders)
 
     total_orders = len(current_orders)
-    total_items = 0
-    total_revenue = 0.0
 
-    for order in current_orders:
-        quantity = int(order.get("quantity", 1))
-        total = float(order.get("total", 0))
+    total_items = sum(
+        order["quantity"]
+        for order in current_orders
+    )
 
-        total_items += quantity
-        total_revenue += total
+    total_revenue = sum(
+        order["total"]
+        for order in current_orders
+    )
 
-    if total_orders > 0:
-        average_order_value = total_revenue / total_orders
-    else:
-        average_order_value = 0
+    average_order_value = (
+        total_revenue / total_orders
+        if total_orders > 0
+        else 0
+    )
 
     return jsonify({
         "total_orders": total_orders,
@@ -94,11 +153,11 @@ def analytics_summary():
 @app.route("/analytics/products", methods=["GET"])
 def analytics_products():
     """
-    Aggregate order statistics by product.
+    Aggregate analytics for each product.
 
     Each product includes:
     - number of orders
-    - total quantity ordered
+    - total quantity
     - total revenue
     """
 
@@ -114,19 +173,17 @@ def analytics_products():
         current_orders = list(orders)
 
     for order in current_orders:
-        product = order.get("product", "Unknown")
-        quantity = int(order.get("quantity", 1))
-        total = float(order.get("total", 0))
+        product_name = order["product"]
 
-        product_stats[product]["orders"] += 1
-        product_stats[product]["quantity"] += quantity
-        product_stats[product]["revenue"] += total
+        product_stats[product_name]["orders"] += 1
+        product_stats[product_name]["quantity"] += order["quantity"]
+        product_stats[product_name]["revenue"] += order["total"]
 
     results = []
 
-    for product, stats in product_stats.items():
+    for product_name, stats in product_stats.items():
         results.append({
-            "product": product,
+            "product": product_name,
             "orders": stats["orders"],
             "quantity": stats["quantity"],
             "revenue": round(stats["revenue"], 2)
@@ -138,7 +195,7 @@ def analytics_products():
 @app.route("/analytics/top-products", methods=["GET"])
 def analytics_top_products():
     """
-    Return products ranked by total quantity ordered.
+    Rank products by total quantity ordered.
     """
 
     product_quantities = defaultdict(int)
@@ -147,10 +204,7 @@ def analytics_top_products():
         current_orders = list(orders)
 
     for order in current_orders:
-        product = order.get("product", "Unknown")
-        quantity = int(order.get("quantity", 1))
-
-        product_quantities[product] += quantity
+        product_quantities[order["product"]] += order["quantity"]
 
     ranked_products = sorted(
         product_quantities.items(),
@@ -171,25 +225,29 @@ def analytics_top_products():
 
 def process_order(channel, method, properties, body):
     """
-    Process one message received from RabbitMQ.
+    Process one RabbitMQ message.
 
-    The message is decoded from JSON and stored in memory.
-    RabbitMQ is acknowledged only after successful processing.
+    The order is normalized and stored before RabbitMQ
+    receives an acknowledgement.
     """
 
     try:
-        # Convert the RabbitMQ message body from bytes
-        # into a Python dictionary.
-        order = json.loads(body.decode("utf-8"))
+        # Decode RabbitMQ message.
+        raw_order = json.loads(
+            body.decode("utf-8")
+        )
 
-        # Store the processed order in memory.
+        # Convert either supported order format
+        # into our standard analytics structure.
+        order = normalize_order(raw_order)
+
+        # Store the normalized order in memory.
         with orders_lock:
             orders.append(order)
 
         print(f"Consumed order: {order}")
 
-        # Remove the message from RabbitMQ only after
-        # successful processing and storage.
+        # Acknowledge only after successful processing.
         channel.basic_ack(
             delivery_tag=method.delivery_tag
         )
@@ -197,7 +255,7 @@ def process_order(channel, method, properties, body):
     except Exception as error:
         print(f"Failed to process order: {error}")
 
-        # Reject the failed message and return it to the queue.
+        # Return failed messages to RabbitMQ.
         channel.basic_nack(
             delivery_tag=method.delivery_tag,
             requeue=True
@@ -206,63 +264,73 @@ def process_order(channel, method, properties, body):
 
 def consume_orders():
     """
-    Continuously connect to RabbitMQ and consume messages
-    from the durable order_queue.
-
-    If RabbitMQ is temporarily unavailable, the service waits
-    and retries instead of stopping the Flask application.
+    Continuously connect to RabbitMQ and consume orders.
     """
 
-    rabbitmq_url = os.getenv("RABBITMQ_CONNECTION_STRING")
+    rabbitmq_url = os.getenv(
+        "RABBITMQ_CONNECTION_STRING"
+    )
 
     if not rabbitmq_url:
-        print("RABBITMQ_CONNECTION_STRING is not configured.")
+        print(
+            "RABBITMQ_CONNECTION_STRING "
+            "is not configured."
+        )
         return
 
     while True:
         try:
-            # Connect to RabbitMQ using the environment-based
-            # connection string.
-            parameters = pika.URLParameters(rabbitmq_url)
+            parameters = pika.URLParameters(
+                rabbitmq_url
+            )
 
-            connection = pika.BlockingConnection(parameters)
+            connection = pika.BlockingConnection(
+                parameters
+            )
+
             channel = connection.channel()
 
-            # Ensure the queue exists and matches the durable
-            # queue used by the Order Service.
+            # Ensure the durable queue exists.
             channel.queue_declare(
                 queue="order_queue",
                 durable=True
             )
 
-            # Process only one unacknowledged message at a time.
+            # Handle one unacknowledged message
+            # at a time.
             channel.basic_qos(
                 prefetch_count=1
             )
 
-            # Register the callback used whenever a new order arrives.
             channel.basic_consume(
                 queue="order_queue",
                 on_message_callback=process_order,
                 auto_ack=False
             )
 
-            print("Connected to RabbitMQ. Waiting for orders...")
+            print(
+                "Connected to RabbitMQ. "
+                "Waiting for orders..."
+            )
 
-            # Continuously wait for new RabbitMQ messages.
             channel.start_consuming()
 
         except Exception as error:
-            print(f"RabbitMQ connection failed: {error}")
-            print("Retrying in 5 seconds...")
+            print(
+                f"RabbitMQ connection failed: {error}"
+            )
+
+            print(
+                "Retrying in 5 seconds..."
+            )
 
             time.sleep(5)
 
 
 def start_consumer():
     """
-    Start the RabbitMQ consumer in a daemon background thread
-    so Flask can serve API requests at the same time.
+    Run the RabbitMQ consumer in a background thread
+    while Flask handles HTTP requests.
     """
 
     consumer_thread = threading.Thread(
@@ -273,18 +341,16 @@ def start_consumer():
     consumer_thread.start()
 
 
-# Start the RabbitMQ consumer as soon as the application is loaded.
-# This is important for Azure App Service because Gunicorn imports
-# app:app instead of running this file directly with python app.py.
+# Start the consumer when Gunicorn imports app.py in Azure.
 start_consumer()
 
 
 if __name__ == "__main__":
-    # Read the service port from the environment.
-    # Port 4000 is used as the default for local development.
-    port = int(os.getenv("PORT", "4000"))
+    # Default local development port.
+    port = int(
+        os.getenv("PORT", "4000")
+    )
 
-    # Run the Flask development server locally.
     app.run(
         host="0.0.0.0",
         port=port,
