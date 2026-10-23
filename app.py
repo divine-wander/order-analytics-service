@@ -12,7 +12,7 @@ from flask_cors import CORS
 
 
 # Load environment variables from the local .env file.
-# In Azure, these values will come from App Service application settings.
+# In Azure, these values come from App Service environment variables.
 load_dotenv()
 
 
@@ -24,7 +24,7 @@ CORS(app)
 
 
 # Store consumed orders in memory.
-# Data will reset whenever the service restarts.
+# These orders will be lost whenever the service restarts.
 orders = []
 
 # Protect the shared orders list because the RabbitMQ consumer
@@ -37,7 +37,6 @@ def health():
     """
     Health check endpoint used to confirm that the service is running.
     """
-
     return jsonify({
         "status": "healthy",
         "service": "order-analytics-service"
@@ -49,7 +48,6 @@ def get_orders():
     """
     Return all orders successfully consumed from RabbitMQ.
     """
-
     with orders_lock:
         return jsonify(orders)
 
@@ -80,11 +78,10 @@ def analytics_summary():
         total_items += quantity
         total_revenue += total
 
-    average_order_value = (
-        total_revenue / total_orders
-        if total_orders > 0
-        else 0
-    )
+    if total_orders > 0:
+        average_order_value = total_revenue / total_orders
+    else:
+        average_order_value = 0
 
     return jsonify({
         "total_orders": total_orders,
@@ -181,7 +178,8 @@ def process_order(channel, method, properties, body):
     """
 
     try:
-        # Convert the RabbitMQ message body from bytes into a Python dictionary.
+        # Convert the RabbitMQ message body from bytes
+        # into a Python dictionary.
         order = json.loads(body.decode("utf-8"))
 
         # Store the processed order in memory.
@@ -190,8 +188,11 @@ def process_order(channel, method, properties, body):
 
         print(f"Consumed order: {order}")
 
-        # Remove the message from RabbitMQ only after successful processing.
-        channel.basic_ack(delivery_tag=method.delivery_tag)
+        # Remove the message from RabbitMQ only after
+        # successful processing and storage.
+        channel.basic_ack(
+            delivery_tag=method.delivery_tag
+        )
 
     except Exception as error:
         print(f"Failed to process order: {error}")
@@ -220,19 +221,24 @@ def consume_orders():
 
     while True:
         try:
-            # Connect to RabbitMQ using the environment-based connection string.
+            # Connect to RabbitMQ using the environment-based
+            # connection string.
             parameters = pika.URLParameters(rabbitmq_url)
+
             connection = pika.BlockingConnection(parameters)
             channel = connection.channel()
 
-            # Match the durable queue created by the Order Service.
+            # Ensure the queue exists and matches the durable
+            # queue used by the Order Service.
             channel.queue_declare(
                 queue="order_queue",
                 durable=True
             )
 
             # Process only one unacknowledged message at a time.
-            channel.basic_qos(prefetch_count=1)
+            channel.basic_qos(
+                prefetch_count=1
+            )
 
             # Register the callback used whenever a new order arrives.
             channel.basic_consume(
@@ -267,15 +273,18 @@ def start_consumer():
     consumer_thread.start()
 
 
-if __name__ == "__main__":
-    # Start the RabbitMQ consumer before starting Flask.
-    start_consumer()
+# Start the RabbitMQ consumer as soon as the application is loaded.
+# This is important for Azure App Service because Gunicorn imports
+# app:app instead of running this file directly with python app.py.
+start_consumer()
 
+
+if __name__ == "__main__":
     # Read the service port from the environment.
     # Port 4000 is used as the default for local development.
     port = int(os.getenv("PORT", "4000"))
 
-    # Listen on all interfaces so the service can later run inside Azure.
+    # Run the Flask development server locally.
     app.run(
         host="0.0.0.0",
         port=port,
