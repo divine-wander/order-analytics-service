@@ -4,3 +4,8 @@
 # Confirms that the Flask service is running successfully.
 GET http://localhost:4000/health
 Accept: application/json
+
+### Consumed Orders
+# Returns every order processed from RabbitMQ since the service started.
+GET http://localhost:4000/orders
+Accept: application/json
