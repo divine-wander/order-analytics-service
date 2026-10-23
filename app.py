@@ -3,6 +3,7 @@ import json
 import os
 import threading
 import time
+from collections import defaultdict
 
 import pika
 from dotenv import load_dotenv
@@ -51,6 +52,124 @@ def get_orders():
 
     with orders_lock:
         return jsonify(orders)
+
+
+@app.route("/analytics/summary", methods=["GET"])
+def analytics_summary():
+    """
+    Return overall order statistics.
+
+    The summary includes:
+    - total number of orders
+    - total quantity of products ordered
+    - total revenue
+    - average order value
+    """
+
+    with orders_lock:
+        current_orders = list(orders)
+
+    total_orders = len(current_orders)
+    total_items = 0
+    total_revenue = 0.0
+
+    for order in current_orders:
+        quantity = int(order.get("quantity", 1))
+        total = float(order.get("total", 0))
+
+        total_items += quantity
+        total_revenue += total
+
+    average_order_value = (
+        total_revenue / total_orders
+        if total_orders > 0
+        else 0
+    )
+
+    return jsonify({
+        "total_orders": total_orders,
+        "total_items": total_items,
+        "total_revenue": round(total_revenue, 2),
+        "average_order_value": round(average_order_value, 2)
+    })
+
+
+@app.route("/analytics/products", methods=["GET"])
+def analytics_products():
+    """
+    Aggregate order statistics by product.
+
+    Each product includes:
+    - number of orders
+    - total quantity ordered
+    - total revenue
+    """
+
+    product_stats = defaultdict(
+        lambda: {
+            "orders": 0,
+            "quantity": 0,
+            "revenue": 0.0
+        }
+    )
+
+    with orders_lock:
+        current_orders = list(orders)
+
+    for order in current_orders:
+        product = order.get("product", "Unknown")
+        quantity = int(order.get("quantity", 1))
+        total = float(order.get("total", 0))
+
+        product_stats[product]["orders"] += 1
+        product_stats[product]["quantity"] += quantity
+        product_stats[product]["revenue"] += total
+
+    results = []
+
+    for product, stats in product_stats.items():
+        results.append({
+            "product": product,
+            "orders": stats["orders"],
+            "quantity": stats["quantity"],
+            "revenue": round(stats["revenue"], 2)
+        })
+
+    return jsonify(results)
+
+
+@app.route("/analytics/top-products", methods=["GET"])
+def analytics_top_products():
+    """
+    Return products ranked by total quantity ordered.
+    """
+
+    product_quantities = defaultdict(int)
+
+    with orders_lock:
+        current_orders = list(orders)
+
+    for order in current_orders:
+        product = order.get("product", "Unknown")
+        quantity = int(order.get("quantity", 1))
+
+        product_quantities[product] += quantity
+
+    ranked_products = sorted(
+        product_quantities.items(),
+        key=lambda item: item[1],
+        reverse=True
+    )
+
+    results = [
+        {
+            "product": product,
+            "quantity": quantity
+        }
+        for product, quantity in ranked_products
+    ]
+
+    return jsonify(results)
 
 
 def process_order(channel, method, properties, body):

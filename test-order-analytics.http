@@ -9,3 +9,15 @@ Accept: application/json
 # Returns every order processed from RabbitMQ since the service started.
 GET http://localhost:4000/orders
 Accept: application/json
+
+### Analytics Summary
+GET http://localhost:4000/analytics/summary
+Accept: application/json
+
+### Product Analytics
+GET http://localhost:4000/analytics/products
+Accept: application/json
+
+### Top Products
+GET http://localhost:4000/analytics/top-products
+Accept: application/json
